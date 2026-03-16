@@ -26,6 +26,8 @@ string cmd_line;                // 命令
 string prev_dir;                // 上次目录
 string current_dir;             // 当前目录
 bool prev_cmd_status = true;    // 上次执行状态
+pid_t fg_pid = -1;              // 前台进程的pid
+bool background;                // 后台
 int job_num = 0;                // 作业计数
 vector<pair<pid_t, job>> jobs;  // pid--job
 
@@ -34,22 +36,20 @@ string get_current_dir();                          // 获取当前目录
 void init_dirs();                                  // 初始化目录
 void splash_screen();                              // 启动界面
 void clear_zom_proc();                             // 清理僵尸进程
-void print_cmd_rompt();                            // 打印命令提示符
+void print_cmd_prompt();                           // 打印命令提示符
 vector<string> split(const string& line, char c);  // 分割命令行
 bool parse_cmd(string& cmd_line,
                vector<vector<string>>& cmd_args,
                string& in_file,
                string& out_file,
-               int& append,
-               bool& background);                       // 解析参数
+               int& append);                            // 解析参数
 bool is_home_subdir(const string& dir, int& pos);       // 判断家目录子目录
 bool exec_cd_cmd(const vector<string>& cd_cmd);         // 执行cd命令
 vector<char*> string_char(const vector<string>& args);  // 类型转换
 bool exec_pipe_cmd(const vector<vector<string>>& cmd_args,
                    const string& in_file,
                    const string& out_file,
-                   const int& append,
-                   const bool& background);  // 执行pipe命令
+                   const int& append);  // 执行pipe命令
 
 int main() {
     signal(SIGINT, SIG_IGN);
@@ -60,7 +60,7 @@ int main() {
     system("clear");
     while (true) {
         clear_zom_proc();
-        print_cmd_rompt();
+        print_cmd_prompt();
         cmd_line.clear();
         if (!getline(cin, cmd_line)) {
             break;
@@ -71,9 +71,8 @@ int main() {
         vector<vector<string>> cmd_args;
         string in_file, out_file;
         int append = O_TRUNC;
-        bool background = false;
-        if (!parse_cmd(cmd_line, cmd_args, in_file, out_file, append,
-                       background)) {
+        background = false;
+        if (!parse_cmd(cmd_line, cmd_args, in_file, out_file, append)) {
             prev_cmd_status = false;
             continue;
         }
@@ -87,7 +86,7 @@ int main() {
                 continue;
             }
         }
-        if (!exec_pipe_cmd(cmd_args, in_file, out_file, append, background)) {
+        if (!exec_pipe_cmd(cmd_args, in_file, out_file, append)) {
             prev_cmd_status = false;
             continue;
         }
@@ -100,30 +99,34 @@ void sigchld_handler(int signum) {
     int status;
     pid_t pid;
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
-        job j;
-        size_t i;
-        for (i = 0; i < jobs.size(); i++) {
-            if (jobs[i].first == pid) {
-                j = jobs[i].second;
-                break;
-            }
-        }
-        cout << endl;
-        cout << "[" << j.num << "] ";
-        if (i == jobs.size() - 1) {
-            cout << " + ";
-        } else if (i == jobs.size() - 2) {
-            cout << " - ";
+        if (pid == fg_pid) {
+            return;
         } else {
-            cout << "   ";
+            job j;
+            size_t i;
+            for (i = 0; i < jobs.size(); i++) {
+                if (jobs[i].first == pid) {
+                    j = jobs[i].second;
+                    break;
+                }
+            }
+            cout << endl;
+            cout << "[" << j.num << "] ";
+            if (i == jobs.size() - 1) {
+                cout << " + ";
+            } else if (i == jobs.size() - 2) {
+                cout << " - ";
+            } else {
+                cout << "   ";
+            }
+            cout << pid << " done       " << j.line << endl;
+            jobs.erase(jobs.begin() + i);
+            --job_num;
+            if (!WIFEXITED(status)) {
+                prev_cmd_status = false;
+            }
+            print_cmd_prompt();
         }
-        cout << pid << " done       " << j.line << endl;
-        jobs.erase(jobs.begin() + i);
-        --job_num;
-        if (!WIFEXITED(status)) {
-            prev_cmd_status = false;
-        }
-        print_cmd_rompt();
     }
 }
 
@@ -174,7 +177,7 @@ void clear_zom_proc() {
     }
 }
 
-void print_cmd_rompt() {
+void print_cmd_prompt() {
     if (prev_cmd_status) {
         cout << GREEN "➜  " RESET;
     } else {
@@ -221,8 +224,7 @@ bool parse_cmd(string& cmd_line,
                vector<vector<string>>& cmd_args,
                string& in_file,
                string& out_file,
-               int& append,
-               bool& background) {
+               int& append) {
     // 判断是否后台运行
     for (auto i = cmd_line.size() - 1; cmd_line[i] == ' ' || cmd_line[i] == '&';
          i--) {
@@ -356,8 +358,7 @@ vector<char*> string_char(const vector<string>& args) {
 bool exec_pipe_cmd(const vector<vector<string>>& cmd_args,
                    const string& in_file,
                    const string& out_file,
-                   const int& append,
-                   const bool& background) {
+                   const int& append) {
     int cmd_num = cmd_args.size();
     int prev_pipe_read = -1;
     vector<pid_t> children;
@@ -396,6 +397,15 @@ bool exec_pipe_cmd(const vector<vector<string>>& cmd_args,
             perror("execvp");
             exit(EXIT_FAILURE);
         } else if (pid > 0) {
+            if (!background) {
+                fg_pid = pid;
+                int status;
+                waitpid(pid, &status, 0);
+                fg_pid = -1;
+                if (!WIFEXITED(status)) {
+                    prev_cmd_status = false;
+                }
+            }
             children.push_back(pid);
             if (prev_pipe_read != -1) {
                 close(prev_pipe_read);
@@ -413,14 +423,6 @@ bool exec_pipe_cmd(const vector<vector<string>>& cmd_args,
     if (background) {
         jobs.push_back({children[0], {++job_num, cmd_line}});
         cout << "[" << jobs.back().second.num << "] " << children[0] << endl;
-    } else {
-        for (pid_t p : children) {
-            int status;
-            waitpid(p, &status, 0);
-            if (status == EXIT_FAILURE) {
-                prev_cmd_status = false;
-            }
-        }
     }
     return true;
 }
